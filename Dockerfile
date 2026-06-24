@@ -14,8 +14,13 @@ ENV NODE_ENV=production
 ENV PORT=5000
 
 COPY package*.json ./
-# Install only production dependencies (this keeps sqlite3 but excludes ts/vite dev deps)
-RUN npm ci --omit=dev
+# Install build tools, install production dependencies, rebuild sqlite3 from source, then clean up
+RUN apt-get update && apt-get install -y python3 make g++ \
+    && npm ci --omit=dev \
+    && npm rebuild sqlite3 --build-from-source \
+    && apt-get purge -y python3 make g++ \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy server code and build assets
 COPY server.cjs ./
