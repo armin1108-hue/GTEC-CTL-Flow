@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+/* Custom theme colors or utilities can be added here using Tailwind v4 syntax */
+:root {
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+}
