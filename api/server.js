@@ -3,7 +3,12 @@ const cors = require("cors");
 const helmet = require("helmet");
 const dotenv = require("dotenv");
 const path = require("path");
-const sqlite3 = require("sqlite3");
+let sqlite3;
+try {
+  sqlite3 = require("sqlite3");
+} catch (e) {
+  console.warn("[GTEC CTL-Flow DB] sqlite3 module load failed, local SQLite mode will not be available:", e.message);
+}
 const { open } = require("sqlite");
 const { Pool } = require("pg");
 
@@ -113,6 +118,9 @@ async function initDb() {
     console.log("[GTEC CTL-Flow DB] Connected to PostgreSQL (Vercel/Neon)");
   } else {
     dbType = "sqlite";
+    if (!sqlite3) {
+      throw new Error("SQLite database driver is not available in this environment. Please configure POSTGRES_URL.");
+    }
     const dbPath = process.env.DATABASE_PATH || path.join(__dirname, "../database.sqlite");
     sqliteDb = await open({
       filename: dbPath,

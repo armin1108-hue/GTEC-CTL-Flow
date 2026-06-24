@@ -23,7 +23,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 # Copy server code and build assets
-COPY server.cjs ./
+COPY api ./api
 COPY database.sql ./
 COPY --from=builder /app/dist ./dist
 
@@ -34,4 +34,4 @@ VOLUME /app/data
 
 EXPOSE 5000
 
-CMD ["node", "server.cjs"]
+CMD ["node", "api/server.js"]
