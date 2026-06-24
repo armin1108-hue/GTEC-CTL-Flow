@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run server\" \"vite\"",
-    "server": "node server.cjs",
-    "start": "node server.cjs",
+    "server": "node api/server.cjs",
+    "start": "node api/server.cjs",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
@@ -19,6 +19,7 @@
     "express": "^5.2.1",
     "helmet": "^8.2.0",
     "lucide-react": "^1.21.0",
+    "pg": "^8.22.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "sqlite": "^5.1.1",

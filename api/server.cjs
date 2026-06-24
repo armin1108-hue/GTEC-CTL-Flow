@@ -5,13 +5,14 @@ const dotenv = require("dotenv");
 const path = require("path");
 const sqlite3 = require("sqlite3");
 const { open } = require("sqlite");
+const { Pool } = require("pg");
 
 // Load Environment Variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const isProd = process.env.NODE_ENV === "production" || process.env.RENDER === "true";
+const isProd = process.env.NODE_ENV === "production" || process.env.RENDER === "true" || process.env.VERCEL === "1";
 
 // Security: Helmet configurations
 app.use(
@@ -26,7 +27,7 @@ app.use(
             connectSrc: ["'self'"],
           },
         }
-      : false, // In dev, disable tight CSP to allow Vite HMR sockets if serving combined
+      : false,
   })
 );
 
@@ -94,40 +95,58 @@ app.use((req, res, next) => {
   next();
 });
 
-// Database setup
-let db;
+// ----------------- Hybrid Database Driver -----------------
+let sqliteDb = null;
+let pgPool = null;
+let dbType = "sqlite"; // "sqlite" or "postgres"
+let dbInitialized = false;
 
 async function initDb() {
-  const dbPath = process.env.DATABASE_PATH || path.join(__dirname, "database.sqlite");
-  db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database,
-  });
+  if (process.env.POSTGRES_URL) {
+    dbType = "postgres";
+    pgPool = new Pool({
+      connectionString: process.env.POSTGRES_URL,
+      ssl: {
+        rejectUnauthorized: false,
+      },
+    });
+    console.log("[GTEC CTL-Flow DB] Connected to PostgreSQL (Vercel/Neon)");
+  } else {
+    dbType = "sqlite";
+    const dbPath = process.env.DATABASE_PATH || path.join(__dirname, "../database.sqlite");
+    sqliteDb = await open({
+      filename: dbPath,
+      driver: sqlite3.Database,
+    });
+    console.log("[GTEC CTL-Flow DB] Connected to SQLite");
+  }
 
-  // Create tables
-  await db.exec(`
+  // Create tables in standard SQL compatible with both SQLite and Postgres
+  await executeQuery(`
     CREATE TABLE IF NOT EXISTS programs (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
+      id VARCHAR(100) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      type VARCHAR(100) NOT NULL,
       purpose TEXT,
-      targetGroup TEXT NOT NULL,
-      startDate TEXT NOT NULL,
-      endDate TEXT NOT NULL,
-      locationOrMethod TEXT,
-      manager TEXT,
+      targetGroup VARCHAR(255) NOT NULL,
+      startDate VARCHAR(50) NOT NULL,
+      endDate VARCHAR(50) NOT NULL,
+      locationOrMethod VARCHAR(255),
+      manager VARCHAR(255),
       maxParticipants INTEGER,
       description TEXT,
-      status TEXT NOT NULL,
-      createdAt TEXT NOT NULL,
-      updatedAt TEXT NOT NULL
+      status VARCHAR(100) NOT NULL,
+      createdAt VARCHAR(100) NOT NULL,
+      updatedAt VARCHAR(100) NOT NULL
     );
+  `);
 
+  await executeQuery(`
     CREATE TABLE IF NOT EXISTS survey_summaries (
-      programId TEXT PRIMARY KEY,
-      surveyTarget TEXT NOT NULL,
-      surveyStartDate TEXT NOT NULL,
-      surveyEndDate TEXT NOT NULL,
+      programId VARCHAR(100) PRIMARY KEY,
+      surveyTarget VARCHAR(255) NOT NULL,
+      surveyStartDate VARCHAR(50) NOT NULL,
+      surveyEndDate VARCHAR(50) NOT NULL,
       surveyLink TEXT,
       qrCodeUrl TEXT,
       totalParticipants INTEGER NOT NULL,
@@ -144,16 +163,18 @@ async function initDb() {
       requestedFutureTopics TEXT NOT NULL,
       FOREIGN KEY (programId) REFERENCES programs (id) ON DELETE CASCADE
     );
+  `);
 
+  await executeQuery(`
     CREATE TABLE IF NOT EXISTS participants (
-      id TEXT PRIMARY KEY,
-      programId TEXT NOT NULL,
-      participantCode TEXT NOT NULL,
-      grade TEXT NOT NULL,
-      majorGroup TEXT NOT NULL,
-      applicationStatus TEXT NOT NULL,
-      attendanceStatus TEXT NOT NULL,
-      completionStatus TEXT NOT NULL,
+      id VARCHAR(100) PRIMARY KEY,
+      programId VARCHAR(100) NOT NULL,
+      participantCode VARCHAR(50) NOT NULL,
+      grade VARCHAR(50) NOT NULL,
+      majorGroup VARCHAR(50) NOT NULL,
+      applicationStatus VARCHAR(100) NOT NULL,
+      attendanceStatus VARCHAR(100) NOT NULL,
+      completionStatus VARCHAR(100) NOT NULL,
       surveySubmitted INTEGER NOT NULL DEFAULT 0,
       overallSatisfaction INTEGER,
       recommendScore INTEGER,
@@ -164,12 +185,103 @@ async function initDb() {
   `);
 
   // Seed default data if database is empty
-  const count = await db.get("SELECT COUNT(*) as count FROM programs");
-  if (count.count === 0) {
+  const count = await getRow("SELECT COUNT(*) as count FROM programs");
+  if (parseInt(count.count) === 0) {
     console.log("Database empty. Seeding initial GTEC CTL-Flow mock data...");
     await seedDefaultData();
   }
+  
+  dbInitialized = true;
 }
+
+// Convert SQLite '?' parameter syntax to PostgreSQL '$1, $2' syntax dynamically
+function prepareQuery(sql, params = []) {
+  if (dbType === "sqlite") {
+    return { sql, params };
+  }
+  let index = 1;
+  const pgSql = sql.replace(/\?/g, () => `$${index++}`);
+  return { sql: pgSql, params };
+}
+
+// Global SQL Executor wrapper
+async function executeQuery(sql, params = []) {
+  const prepared = prepareQuery(sql, params);
+  if (dbType === "postgres") {
+    if (prepared.sql.trim().toUpperCase().startsWith("PRAGMA")) {
+      return { rowCount: 1 };
+    }
+    return await pgPool.query(prepared.sql, prepared.params);
+  } else {
+    return await sqliteDb.run(prepared.sql, prepared.params);
+  }
+}
+
+// Fetch all rows
+async function getRows(sql, params = []) {
+  const prepared = prepareQuery(sql, params);
+  if (dbType === "postgres") {
+    const res = await pgPool.query(prepared.sql, prepared.params);
+    return res.rows;
+  } else {
+    return await sqliteDb.all(prepared.sql, prepared.params);
+  }
+}
+
+// Fetch a single row
+async function getRow(sql, params = []) {
+  const prepared = prepareQuery(sql, params);
+  if (dbType === "postgres") {
+    const res = await pgPool.query(prepared.sql, prepared.params);
+    return res.rows[0] || null;
+  } else {
+    return (await sqliteDb.get(prepared.sql, prepared.params)) || null;
+  }
+}
+
+// Transaction helper supporting both SQLite and PostgreSQL client connection reuse
+async function executeTransaction(queries) {
+  if (dbType === "postgres") {
+    const client = await pgPool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const q of queries) {
+        const prep = prepareQuery(q.sql, q.params);
+        await client.query(prep.sql, prep.params);
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    await sqliteDb.run("BEGIN TRANSACTION");
+    try {
+      for (const q of queries) {
+        await sqliteDb.run(q.sql, q.params);
+      }
+      await sqliteDb.run("COMMIT");
+    } catch (err) {
+      await sqliteDb.run("ROLLBACK");
+      throw err;
+    }
+  }
+}
+
+// Lazy-loader database middleware to ensure tables exist in Serverless (Vercel Cold-Starts)
+app.use(async (req, res, next) => {
+  if (!dbInitialized) {
+    try {
+      await initDb();
+    } catch (err) {
+      console.error("DB Initialization error inside middleware:", err);
+      return res.status(500).json({ error: "Database connection failed" });
+    }
+  }
+  next();
+});
 
 async function seedDefaultData() {
   const mockProgram = {
@@ -228,7 +340,7 @@ async function seedDefaultData() {
   };
 
   // Seed Program
-  await db.run(
+  await executeQuery(
     `INSERT INTO programs (id, name, type, purpose, targetGroup, startDate, endDate, locationOrMethod, manager, maxParticipants, description, status, createdAt, updatedAt) 
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -250,7 +362,7 @@ async function seedDefaultData() {
   );
 
   // Seed Survey
-  await db.run(
+  await executeQuery(
     `INSERT INTO survey_summaries (programId, surveyTarget, surveyStartDate, surveyEndDate, surveyLink, qrCodeUrl, totalParticipants, respondents, responseRate, averageOverallSatisfaction, averageRecommendScore, averageContentScore, averageOperationScore, averageLearningOutcomeScore, averageAiEthicsScore, positiveComments, improvementComments, requestedFutureTopics) 
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -279,9 +391,9 @@ async function seedDefaultData() {
   const grades = ["1학년", "2학년", "3학년"];
   const majors = ["공학계열", "자연과학계열", "인문사회계열", "예체능계열"];
   const satisfactionScores = [
-    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, // 16 fives
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,                // 11 fours
-    3,                                              // 1 three
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    3,
   ];
 
   for (let i = 0; i < 30; i++) {
@@ -294,7 +406,7 @@ async function seedDefaultData() {
     const attendanceStatus = idNum === 30 ? "Absent" : "Attended";
     const completionStatus = idNum === 30 ? "Not Completed" : "Completed";
 
-    await db.run(
+    await executeQuery(
       `INSERT INTO participants (id, programId, participantCode, grade, majorGroup, applicationStatus, attendanceStatus, completionStatus, surveySubmitted, overallSatisfaction, recommendScore, note) 
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -315,14 +427,12 @@ async function seedDefaultData() {
   }
 }
 
-// ----------------- API Endpoints -----------------
-
 // Helper to bundle program with its survey summary
 async function getFullProgram(programId) {
-  const program = await db.get("SELECT * FROM programs WHERE id = ?", [programId]);
+  const program = await getRow("SELECT * FROM programs WHERE id = ?", [programId]);
   if (!program) return null;
 
-  const survey = await db.get("SELECT * FROM survey_summaries WHERE programId = ?", [programId]);
+  const survey = await getRow("SELECT * FROM survey_summaries WHERE programId = ?", [programId]);
   if (survey) {
     survey.positiveComments = JSON.parse(survey.positiveComments);
     survey.improvementComments = JSON.parse(survey.improvementComments);
@@ -332,10 +442,12 @@ async function getFullProgram(programId) {
   return program;
 }
 
+// ----------------- API Endpoints -----------------
+
 // REST 1: Get Programs
 app.get("/api/programs", async (req, res) => {
   try {
-    const programsList = await db.all("SELECT id FROM programs");
+    const programsList = await getRows("SELECT id FROM programs");
     const fullPrograms = [];
     for (const p of programsList) {
       const full = await getFullProgram(p.id);
@@ -380,12 +492,11 @@ app.post("/api/programs", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const existing = await db.get("SELECT id FROM programs WHERE id = ?", [id]);
+    const existing = await getRow("SELECT id FROM programs WHERE id = ?", [id]);
     const now = new Date().toISOString();
 
     if (existing) {
-      // Update
-      await db.run(
+      await executeQuery(
         `UPDATE programs SET 
           name = ?, type = ?, purpose = ?, targetGroup = ?, startDate = ?, endDate = ?, 
           locationOrMethod = ?, manager = ?, maxParticipants = ?, description = ?, status = ?, updatedAt = ?
@@ -393,8 +504,7 @@ app.post("/api/programs", async (req, res) => {
         [name, type, purpose, targetGroup, startDate, endDate, locationOrMethod, manager, maxParticipants, description, status, now, id]
       );
     } else {
-      // Insert
-      await db.run(
+      await executeQuery(
         `INSERT INTO programs 
           (id, name, type, purpose, targetGroup, startDate, endDate, locationOrMethod, manager, maxParticipants, description, status, createdAt, updatedAt) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -413,9 +523,10 @@ app.post("/api/programs", async (req, res) => {
 // REST 4: Delete Program
 app.delete("/api/programs/:id", async (req, res) => {
   try {
-    await db.run("PRAGMA foreign_keys = ON");
-    const result = await db.run("DELETE FROM programs WHERE id = ?", [req.params.id]);
-    if (result.changes === 0) {
+    await executeQuery("PRAGMA foreign_keys = ON");
+    const result = await executeQuery("DELETE FROM programs WHERE id = ?", [req.params.id]);
+    const changes = dbType === "postgres" ? result.rowCount : result.changes;
+    if (changes === 0) {
       return res.status(404).json({ error: "Program not found" });
     }
     res.json({ message: "Program and all associated records deleted successfully" });
@@ -436,7 +547,7 @@ app.get("/api/participants", async (req, res) => {
       params.push(programId);
     }
 
-    const list = await db.all(query, params);
+    const list = await getRows(query, params);
     const mapped = list.map((p) => ({
       ...p,
       surveySubmitted: p.surveySubmitted === 1,
@@ -473,7 +584,7 @@ app.post("/api/participants", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const existing = await db.get("SELECT id FROM participants WHERE id = ?", [id]);
+    const existing = await getRow("SELECT id FROM participants WHERE id = ?", [id]);
     
     const codeRegex = /^P[0-9]{3,5}$/i;
     if (!codeRegex.test(participantCode)) {
@@ -481,7 +592,7 @@ app.post("/api/participants", async (req, res) => {
     }
 
     if (existing) {
-      await db.run(
+      await executeQuery(
         `UPDATE participants SET 
           programId = ?, participantCode = ?, grade = ?, majorGroup = ?, 
           applicationStatus = ?, attendanceStatus = ?, completionStatus = ?, 
@@ -503,12 +614,12 @@ app.post("/api/participants", async (req, res) => {
         ]
       );
     } else {
-      const duplicateCode = await db.get("SELECT id FROM participants WHERE programId = ? AND participantCode = ?", [programId, participantCode]);
+      const duplicateCode = await getRow("SELECT id FROM participants WHERE programId = ? AND participantCode = ?", [programId, participantCode]);
       if (duplicateCode) {
         return res.status(400).json({ error: "Participant code already exists in this program" });
       }
 
-      await db.run(
+      await executeQuery(
         `INSERT INTO participants 
           (id, programId, participantCode, grade, majorGroup, applicationStatus, attendanceStatus, completionStatus, surveySubmitted, overallSatisfaction, recommendScore, note) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -531,7 +642,7 @@ app.post("/api/participants", async (req, res) => {
 
     await syncProgramStats(programId);
 
-    const saved = await db.get("SELECT * FROM participants WHERE id = ?", [id]);
+    const saved = await getRow("SELECT * FROM participants WHERE id = ?", [id]);
     saved.surveySubmitted = saved.surveySubmitted === 1;
     res.json(saved);
   } catch (err) {
@@ -540,7 +651,7 @@ app.post("/api/participants", async (req, res) => {
   }
 });
 
-// REST 7: Save Participants Bulk
+// REST 7: Save Participants Bulk (Universal SQL overwriting transaction)
 app.post("/api/participants/bulk", async (req, res) => {
   try {
     const list = req.body;
@@ -548,13 +659,17 @@ app.post("/api/participants/bulk", async (req, res) => {
       return res.status(400).json({ error: "Request body must be an array of participants" });
     }
 
-    await db.run("BEGIN TRANSACTION");
+    const queries = [];
     for (const p of list) {
-      await db.run(
-        `INSERT OR REPLACE INTO participants 
+      queries.push({
+        sql: "DELETE FROM participants WHERE id = ?",
+        params: [p.id]
+      });
+      queries.push({
+        sql: `INSERT INTO participants 
           (id, programId, participantCode, grade, majorGroup, applicationStatus, attendanceStatus, completionStatus, surveySubmitted, overallSatisfaction, recommendScore, note) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
+        params: [
           p.id,
           p.programId,
           p.participantCode,
@@ -568,16 +683,16 @@ app.post("/api/participants/bulk", async (req, res) => {
           p.recommendScore !== undefined ? p.recommendScore : null,
           p.note !== undefined ? p.note : null,
         ]
-      );
+      });
     }
-    await db.run("COMMIT");
+
+    await executeTransaction(queries);
 
     if (list.length > 0) {
       await syncProgramStats(list[0].programId);
     }
     res.json({ message: `Successfully saved ${list.length} participants` });
   } catch (err) {
-    await db.run("ROLLBACK");
     console.error(err);
     res.status(500).json({ error: "Failed to save bulk participants" });
   }
@@ -586,12 +701,12 @@ app.post("/api/participants/bulk", async (req, res) => {
 // REST 8: Delete Participant
 app.delete("/api/participants/:id", async (req, res) => {
   try {
-    const participant = await db.get("SELECT programId FROM participants WHERE id = ?", [req.params.id]);
+    const participant = await getRow("SELECT programId FROM participants WHERE id = ?", [req.params.id]);
     if (!participant) {
       return res.status(404).json({ error: "Participant not found" });
     }
 
-    await db.run("DELETE FROM participants WHERE id = ?", [req.params.id]);
+    await executeQuery("DELETE FROM participants WHERE id = ?", [req.params.id]);
     await syncProgramStats(participant.programId);
 
     res.json({ message: "Participant deleted successfully" });
@@ -624,14 +739,14 @@ app.post("/api/programs/:id/survey", async (req, res) => {
       requestedFutureTopics,
     } = req.body;
 
-    const existing = await db.get("SELECT programId FROM survey_summaries WHERE programId = ?", [programId]);
+    const existing = await getRow("SELECT programId FROM survey_summaries WHERE programId = ?", [programId]);
 
     const posJson = JSON.stringify(positiveComments || []);
     const impJson = JSON.stringify(improvementComments || []);
     const futJson = JSON.stringify(requestedFutureTopics || []);
 
     if (existing) {
-      await db.run(
+      await executeQuery(
         `UPDATE survey_summaries SET 
           surveyTarget = ?, surveyStartDate = ?, surveyEndDate = ?, surveyLink = ?, qrCodeUrl = ?, 
           totalParticipants = ?, respondents = ?, responseRate = ?, 
@@ -649,7 +764,7 @@ app.post("/api/programs/:id/survey", async (req, res) => {
         ]
       );
     } else {
-      await db.run(
+      await executeQuery(
         `INSERT INTO survey_summaries 
           (programId, surveyTarget, surveyStartDate, surveyEndDate, surveyLink, qrCodeUrl, totalParticipants, respondents, responseRate, averageOverallSatisfaction, averageRecommendScore, averageContentScore, averageOperationScore, averageLearningOutcomeScore, averageAiEthicsScore, positiveComments, improvementComments, requestedFutureTopics) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -674,8 +789,8 @@ app.post("/api/programs/:id/survey", async (req, res) => {
 // REST 10: Reset DB to default mock data
 app.post("/api/reset", async (req, res) => {
   try {
-    await db.run("PRAGMA foreign_keys = ON");
-    await db.run("DELETE FROM programs");
+    await executeQuery("PRAGMA foreign_keys = ON");
+    await executeQuery("DELETE FROM programs");
     await seedDefaultData();
     res.json({ message: "Database reset to CTL default mock data successfully" });
   } catch (err) {
@@ -685,10 +800,10 @@ app.post("/api/reset", async (req, res) => {
 });
 
 async function syncProgramStats(programId) {
-  const survey = await db.get("SELECT * FROM survey_summaries WHERE programId = ?", [programId]);
+  const survey = await getRow("SELECT * FROM survey_summaries WHERE programId = ?", [programId]);
   if (!survey) return;
 
-  const participants = await db.all("SELECT * FROM participants WHERE programId = ?", [programId]);
+  const participants = await getRows("SELECT * FROM participants WHERE programId = ?", [programId]);
   const total = participants.length;
   const respondents = participants.filter((p) => p.surveySubmitted === 1);
   const respondentsCount = respondents.length;
@@ -710,7 +825,7 @@ async function syncProgramStats(programId) {
 
   const responseRate = total > 0 ? Math.round((respondentsCount / total) * 1000) / 10 : 0;
 
-  await db.run(
+  await executeQuery(
     `UPDATE survey_summaries SET 
       totalParticipants = ?, respondents = ?, responseRate = ?, 
       averageOverallSatisfaction = ?, averageRecommendScore = ?
@@ -719,9 +834,9 @@ async function syncProgramStats(programId) {
   );
 }
 
-// ----------------- Production Static Hosting -----------------
-if (isProd) {
-  const distPath = path.join(__dirname, "dist");
+// ----------------- Local Production Static Hosting -----------------
+if (isProd && !process.env.VERCEL) {
+  const distPath = path.join(__dirname, "../dist");
   app.use(express.static(distPath));
 
   app.get("*", (req, res) => {
@@ -729,14 +844,19 @@ if (isProd) {
   });
 }
 
-// Start Server
-initDb()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`[GTEC CTL-Flow Server] running on http://localhost:${PORT}`);
-      console.log(`Environment: ${isProd ? "Production" : "Development"}`);
+// Start Server locally (skip when hosted as Vercel Serverless Function)
+if (!process.env.VERCEL) {
+  initDb()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`[GTEC CTL-Flow Server] running on http://localhost:${PORT}`);
+        console.log(`Environment: ${isProd ? "Production" : "Development"}`);
+      });
+    })
+    .catch((err) => {
+      console.error("Failed to initialize database:", err);
     });
-  })
-  .catch((err) => {
-    console.error("Failed to initialize database:", err);
-  });
+}
+
+// Export for Vercel Serverless runtime
+module.exports = app;
