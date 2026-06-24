@@ -7,20 +7,20 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Runtime Environment
-FROM node:20-slim AS runner
+FROM ubuntu:24.04 AS runner
 WORKDIR /app
+
+# Install Node.js 20 from NodeSource (Ubuntu 24.04 has GLIBC 2.39 which satisfies SQLite3 GLIBC 2.38 requirement)
+RUN apt-get update && apt-get install -y curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
 ENV PORT=5000
 
 COPY package*.json ./
-# Install build tools, install production dependencies, rebuild sqlite3 from source, then clean up
-RUN apt-get update && apt-get install -y python3 make g++ \
-    && npm ci --omit=dev \
-    && npm rebuild sqlite3 --build-from-source \
-    && apt-get purge -y python3 make g++ \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+RUN npm ci --omit=dev
 
 # Copy server code and build assets
 COPY server.cjs ./
